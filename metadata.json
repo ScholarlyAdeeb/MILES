@@ -1,0 +1,6 @@
+{
+  "name": "MILES - Urban Drive & Traversal Experience",
+  "description": "Music-first social urban drive and rooftop kinetic traversal experience built with Three.js and React Three Fiber.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
