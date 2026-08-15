@@ -2,24 +2,33 @@ import React, { useRef } from 'react';
 import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import { player, STATES, PHASE } from '../../playerState.js';
-import { groundHeightAt, solidAt, findAnchorLook, ledgeTopAt } from '../../world.js';
+import { 
+  groundHeightAt, 
+  solidAt, 
+  findAnchorLook, 
+  ledgeTopAt, 
+  findZipPointTarget, 
+  checkVaultObstacle 
+} from '../../world.js';
 import { useNetwork } from '../../NetworkEngine.jsx';
 
 // Kinematic Physics Constants
 const GRAVITY = -32;
-const RUN_ACCEL = 60;
+const RUN_ACCEL = 65;
 const MAX_RUN = 12;
-const MAX_SPRINT = 21;
+const MAX_SPRINT = 22;
 const FRICTION = 9.5;
 const AIR_ACCEL = 18;
-const JUMP_IMPULSE = 13.5;
+const JUMP_IMPULSE = 14.0;
 const COYOTE = 0.12; // 120ms
 const JUMP_BUFFER = 0.15; // 150ms
-const WALL_RUN_TIME = 2.2;
+const WALL_RUN_TIME = 2.5;
 const WALL_RAY = 1.35;
 const DIVE_GRAVITY_SCALE = 2.5;
 const GLIDE_TERMINAL = -2.0;
 const MANTLE_TIME = 0.25;
+const VAULT_TIME = 0.22;
+const ZIP_SPEED = 46.0;
 
 function clamp(v, min, max) {
   return Math.min(Math.max(v, min), max);
@@ -40,9 +49,16 @@ export function PlayerController({ input, onTelemetryUpdate }) {
   const hoodieRef = useRef(null);
 
   const grappleCooldown = useRef(0);
+  const webZipCooldown = useRef(0);
+  const zipPointCooldown = useRef(0);
   const swingTimer = useRef(0);
   const mantle = useRef(null);
+  const vault = useRef(null);
   const lastBroadcastRef = useRef(0);
+
+  // Trick state timers & rotation accumulators
+  const trickTimerRef = useRef(0);
+  const trickRotAccumRef = useRef({ x: 0, y: 0, z: 0 });
 
   // "On-Twos" Animation Stepper (12 FPS animation pose sampling)
   const lastAnimTickRef = useRef(-1);
@@ -66,18 +82,26 @@ export function PlayerController({ input, onTelemetryUpdate }) {
       strafe: 0,
       jump: false,
       sprint: false,
+      ctrl: false,
       down: false,
       yawDelta: 0,
       pitchDelta: 0,
       jumpPressed: false,
       jumpReleased: false,
-      grapplePressed: false
+      grapplePressed: false,
+      swing: false,
+      swingPressed: false,
+      zipPoint: false,
+      zipPointPressed: false,
+      webZip: false,
+      webZipPressed: false,
+      trick: false
     };
     const p = player;
 
     // 1. Orientation & Mouse Look
     p.rotation += i.yawDelta || 0;
-    p.pitch = clamp(p.pitch + (i.pitchDelta || 0), -0.95, 0.7);
+    p.pitch = clamp(p.pitch + (i.pitchDelta || 0), -0.95, 0.75);
     if (i.yawDelta) i.yawDelta = 0;
     if (i.pitchDelta) i.pitchDelta = 0;
 
@@ -94,15 +118,23 @@ export function PlayerController({ input, onTelemetryUpdate }) {
     const jumpPressed = i.jumpPressed;
     const jumpReleased = i.jumpReleased;
     const grapplePressed = i.grapplePressed;
+    const zipPointPressed = i.zipPointPressed;
+    const webZipPressed = i.webZipPressed;
+
     i.jumpPressed = false;
     i.jumpReleased = false;
     i.grapplePressed = false;
+    i.zipPointPressed = false;
+    i.webZipPressed = false;
 
     if (jumpPressed) p.jumpBuffer = JUMP_BUFFER;
     else p.jumpBuffer = Math.max(0, p.jumpBuffer - dt);
 
     grappleCooldown.current = Math.max(0, grappleCooldown.current - dt);
+    webZipCooldown.current = Math.max(0, webZipCooldown.current - dt);
+    zipPointCooldown.current = Math.max(0, zipPointCooldown.current - dt);
     p.landTimer = Math.max(0, p.landTimer - dt);
+    p.zipLaunchWindow = Math.max(0, p.zipLaunchWindow - dt);
 
     const wishX = fx * (i.forward || 0) + rx * (i.strafe || 0);
     const wishZ = fz * (i.forward || 0) + rz * (i.strafe || 0);
@@ -111,26 +143,172 @@ export function PlayerController({ input, onTelemetryUpdate }) {
     const wz = wishZ / wishLen;
     const hasWish = Math.abs(i.forward || 0) + Math.abs(i.strafe || 0) > 0;
 
-    // 2. Grapple Target Reticle Cone-Cast
-    p.anchorCandidate = p.phase === PHASE.SWING
-      ? null
-      : findAnchorLook(x, y + 1.4, z, fx * lookScale, lookY, fz * lookScale, 45);
+    // 2. Aim Cone-Casts for Swing Anchors and Zip-to-Point Targets
+    if (p.phase !== PHASE.SWING && p.phase !== PHASE.ZIP_POINT) {
+      p.anchorCandidate = findAnchorLook(x, y + 1.4, z, fx * lookScale, lookY, fz * lookScale, 50);
+      p.zipCandidate = findZipPointTarget(x, y + 1.4, z, fx * lookScale, lookY, fz * lookScale, 75);
+    } else {
+      p.anchorCandidate = null;
+      p.zipCandidate = null;
+    }
 
-    // 3. Grapple Shoot / Release
-    if (p.phase !== PHASE.SWING && grapplePressed && grappleCooldown.current <= 0) {
-      const anchor = p.anchorCandidate;
+    // ─────────────────────────────────────────────────────────────
+    // 3. ZIP TO POINT (LEDGE TARGET: F / Middle Mouse)
+    // ─────────────────────────────────────────────────────────────
+    if (zipPointPressed && zipPointCooldown.current <= 0 && p.phase !== PHASE.ZIP_POINT) {
+      const zipTarget = p.zipCandidate || findZipPointTarget(x, y + 1.4, z, fx * lookScale, lookY, fz * lookScale, 75);
+      if (zipTarget) {
+        p.zipTarget = zipTarget;
+        p.phase = PHASE.ZIP_POINT;
+        p.state = STATES.ZIP_TO_POINT;
+        p.anchor = null;
+        zipPointCooldown.current = 0.4;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 4. WEB ZIP (AIR LINE-BOOST: C / Quick Right Click in Open Air)
+    // ─────────────────────────────────────────────────────────────
+    if (webZipPressed && webZipCooldown.current <= 0 && (p.phase === PHASE.AIR || p.phase === PHASE.SWING)) {
+      p.phase = PHASE.AIR;
+      p.anchor = null;
+      p.state = STATES.WEB_ZIP;
+      p.webZipActive = true;
+      p.webZipTimer = 0.26;
+      webZipCooldown.current = 0.65;
+
+      // Apply linear forward impulse along camera look vector
+      const boostSpeed = 22.0;
+      vx = fx * lookScale * boostSpeed;
+      vz = fz * lookScale * boostSpeed;
+      vy = Math.max(vy * 0.4, 0) + Math.max(3.0, lookY * 12.0);
+
+      // Web zip visual line origin and target
+      p.webZipOrigin = [x, y + 1.2, z];
+      p.webZipTarget = [x + fx * lookScale * 18, y + 1.2 + lookY * 18, z + fz * lookScale * 18];
+    }
+
+    if (p.webZipActive) {
+      p.webZipTimer -= dt;
+      if (p.webZipTimer <= 0) {
+        p.webZipActive = false;
+        p.webZipOrigin = null;
+        p.webZipTarget = null;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 5. WEB SWING TRIGGER (Shift / Right Click hold while airborne)
+    // ─────────────────────────────────────────────────────────────
+    const isSwingInput = (i.grapple || i.swing || grapplePressed) && !p.grounded;
+    if (p.phase !== PHASE.SWING && p.phase !== PHASE.ZIP_POINT && isSwingInput && grappleCooldown.current <= 0) {
+      const anchor = p.anchorCandidate || findAnchorLook(x, y + 1.4, z, fx * lookScale, lookY, fz * lookScale, 50);
       if (anchor) {
         p.anchor = anchor;
         p.ropeLength = Math.hypot(anchor[0] - x, anchor[1] - (y + 1.2), anchor[2] - z);
         p.phase = PHASE.SWING;
-        p.state = STATES.GRAPPLING;
+        p.state = STATES.SWINGING;
         swingTimer.current = 0;
+
+        // Transfer dive kinetic energy into massive forward swing angular momentum
+        if (p.diveKineticEnergy > 0) {
+          const diveBoost = Math.min(p.diveKineticEnergy * 1.8, 16);
+          vx += fx * diveBoost;
+          vz += fz * diveBoost;
+          p.diveKineticEnergy = 0;
+        }
       }
     }
 
-    // 4. State Machine Branching
-    if (p.phase === PHASE.MANTLE) {
-      // ---- MANTLING ----
+    // ─────────────────────────────────────────────────────────────
+    // 6. STATE MACHINE BRANCHING & PHYSICS
+    // ─────────────────────────────────────────────────────────────
+
+    // ---- A. ZIP TO POINT EXECUTION ----
+    if (p.phase === PHASE.ZIP_POINT) {
+      const zt = p.zipTarget;
+      if (!zt) {
+        p.phase = PHASE.AIR;
+      } else {
+        const toX = zt[0] - x;
+        const toY = zt[1] - y;
+        const toZ = zt[2] - z;
+        const dist = Math.hypot(toX, toY, toZ);
+
+        p.state = STATES.ZIP_TO_POINT;
+
+        // Arrival or Point Launch Window
+        if (dist < 2.8 || jumpPressed) {
+          p.zipLaunchWindow = 0.35;
+
+          // POINT LAUNCH: Tap Space to launch with explosive kinetic vector
+          if (jumpPressed || (i.jump && dist < 3.2)) {
+            p.phase = PHASE.AIR;
+            p.state = STATES.POINT_LAUNCH;
+            p.zipTarget = null;
+            p.zipLaunchWindow = 0;
+
+            const launchSpeed = 30.0;
+            vx = fx * launchSpeed;
+            vz = fz * launchSpeed;
+            vy = 14.0; // High vertical launch
+            p.diveKineticEnergy = 0;
+          } else if (dist < 1.2) {
+            // Normal arrival at ledge
+            x = zt[0];
+            y = zt[1];
+            z = zt[2];
+            vx = fx * 8;
+            vz = fz * 8;
+            vy = 0;
+            p.phase = PHASE.GROUND;
+            p.grounded = true;
+            p.zipTarget = null;
+          }
+        } else {
+          // Pull player at high velocity along line of sight
+          const dirX = toX / dist;
+          const dirY = toY / dist;
+          const dirZ = toZ / dist;
+
+          vx = dirX * ZIP_SPEED;
+          vy = dirY * ZIP_SPEED;
+          vz = dirZ * ZIP_SPEED;
+
+          x += vx * dt;
+          y += vy * dt;
+          z += vz * dt;
+        }
+      }
+    }
+    // ---- B. VAULTING OVER OBSTACLES ----
+    else if (p.phase === PHASE.VAULT) {
+      const v = vault.current;
+      if (!v) {
+        p.phase = PHASE.GROUND;
+      } else {
+        v.t += dt / VAULT_TIME;
+        const u = clamp(v.t, 0, 1);
+        const eased = easeInOutCubic(u);
+        x = THREE.MathUtils.lerp(v.from[0], v.to[0], eased);
+        z = THREE.MathUtils.lerp(v.from[2], v.to[2], eased);
+        // Parabolic arc up and over
+        const arcY = Math.sin(u * Math.PI) * 0.45;
+        y = THREE.MathUtils.lerp(v.from[1], v.to[1], eased) + arcY;
+        p.state = STATES.VAULTING;
+
+        if (u >= 1) {
+          p.phase = PHASE.GROUND;
+          p.grounded = true;
+          // Preserve full sprint horizontal speed
+          vx = fx * MAX_SPRINT;
+          vz = fz * MAX_SPRINT;
+          vault.current = null;
+        }
+      }
+    }
+    // ---- C. MANTLING ----
+    else if (p.phase === PHASE.MANTLE) {
       const m = mantle.current;
       if (!m) {
         p.phase = PHASE.AIR;
@@ -151,18 +329,22 @@ export function PlayerController({ input, onTelemetryUpdate }) {
           mantle.current = null;
         }
       }
-    } else if (p.phase === PHASE.SWING) {
-      // ---- PENDULUM GRAPPLE & SWINGING ----
+    }
+    // ---- D. PENDULUM WEB SWINGING ----
+    else if (p.phase === PHASE.SWING) {
       swingTimer.current += dt;
       const a = p.anchor;
-      if (!a || (jumpPressed && swingTimer.current > 0.08)) {
-        // Tangential release with dynamic forward launch boost
+
+      // Detach constraint on Jump / Space -> Momentum Launch
+      if (!a || (jumpPressed && swingTimer.current > 0.06)) {
         p.phase = PHASE.AIR;
         p.state = STATES.JUMPING;
         p.anchor = null;
         grappleCooldown.current = 0.35;
-        vy = Math.max(vy, 0) + 8.5;
-        const forwardPush = 1.35;
+
+        // Tangential velocity launch + forward boost force
+        vy = Math.max(vy, 2.0) + 9.5;
+        const forwardPush = 1.38;
         vx *= forwardPush;
         vz *= forwardPush;
       } else {
@@ -171,22 +353,22 @@ export function PlayerController({ input, onTelemetryUpdate }) {
         const ay = a[1];
         const az = a[2];
 
-        // Pendulum constraint & tension
+        // Pendulum vector from anchor to player
         let toX = x - ax;
         let toY = y - ay;
         let toZ = z - az;
         let dist = Math.hypot(toX, toY, toZ) || 0.001;
 
-        // Apply gravity
+        // Pendulum gravity acceleration: a = g * sin(theta)
         vy += GRAVITY * dt;
 
-        // Add swing pumping along look direction
+        // Add swing pumping along camera heading
         if (hasWish) {
-          vx += wx * AIR_ACCEL * 1.5 * dt;
-          vz += wz * AIR_ACCEL * 1.5 * dt;
+          vx += wx * AIR_ACCEL * 1.8 * dt;
+          vz += wz * AIR_ACCEL * 1.8 * dt;
         }
 
-        // Integrate tentative velocity
+        // Integrate velocity
         x += vx * dt;
         y += vy * dt;
         z += vz * dt;
@@ -196,7 +378,7 @@ export function PlayerController({ input, onTelemetryUpdate }) {
         toZ = z - az;
         dist = Math.hypot(toX, toY, toZ) || 0.001;
 
-        // Constrain to rope sphere radius
+        // Distance constraint: R = ||P_player - P_anchor||
         const targetLen = p.ropeLength;
         if (dist > targetLen) {
           const nx = toX / dist;
@@ -207,47 +389,55 @@ export function PlayerController({ input, onTelemetryUpdate }) {
           y = ay + ny * targetLen;
           z = az + nz * targetLen;
 
-          // Project velocity onto sphere tangent
+          // Project velocity onto sphere tangent: v_tangential
           const vDotN = vx * nx + vy * ny + vz * nz;
           vx -= vDotN * nx;
           vy -= vDotN * ny;
           vz -= vDotN * nz;
-          // Cable tension preservation boost
-          vx *= 1.002;
-          vz *= 1.002;
+
+          // Cable tension preservation
+          vx *= 1.003;
+          vz *= 1.003;
         }
 
         // Auto release if above anchor or stalling
-        if (y > ay + 1 || (dist < 3 && swingTimer.current > 0.6)) {
+        if (y > ay + 1.2 || (dist < 3.5 && swingTimer.current > 0.7)) {
           p.phase = PHASE.AIR;
           p.anchor = null;
-          grappleCooldown.current = 0.4;
-          vy += 6.5;
+          grappleCooldown.current = 0.35;
+          vy += 7.0;
         }
       }
-    } else {
-      // ---- GROUND / AIR / WALL TRAVERSAL ----
-
-      // Lateral raycasting for walls (-90 deg and +90 deg)
+    }
+    // ---- E. GROUND / AIR / WALL TRAVERSAL ----
+    else {
+      // Wall detection raycasts: Left, Right, and Front
       const rayL_x = -rx;
       const rayL_z = -rz;
       const rayR_x = rx;
       const rayR_z = rz;
+      const rayF_x = fx;
+      const rayF_z = fz;
 
       const hitL = solidAt(x + rayL_x * WALL_RAY, y + 1.2, z + rayL_z * WALL_RAY, 0.2);
       const hitR = solidAt(x + rayR_x * WALL_RAY, y + 1.2, z + rayR_z * WALL_RAY, 0.2);
+      const hitF = solidAt(x + rayF_x * WALL_RAY, y + 1.2, z + rayF_z * WALL_RAY, 0.2);
 
-      const canWallRun = !p.grounded && (hitL || hitR) && vy < 8 && Math.hypot(vx, vz) > 4;
+      const isWallRunningInput = i.sprint || i.forward > 0;
+      const canWallRun = !p.grounded && (hitL || hitR || hitF) && isWallRunningInput && p.wallTimer < WALL_RUN_TIME;
 
       if (canWallRun && (p.phase === PHASE.AIR || p.phase === PHASE.WALL)) {
-        // ---- WALL RUNNING (LEFT / RIGHT) ----
+        // ---- WALL RUN (HORIZONTAL & VERTICAL) ----
         p.phase = PHASE.WALL;
-        const isLeft = !!hitL;
-        p.wallSide = isLeft ? -1 : 1;
-        p.state = isLeft ? STATES.WALL_RUNNING_LEFT : STATES.WALL_RUNNING_RIGHT;
-        p.wallTimer = Math.min(WALL_RUN_TIME, p.wallTimer + dt);
+        p.wallTimer += dt;
 
-        const wallB = isLeft ? hitL : hitR;
+        let wallB = hitF || hitL || hitR;
+        let isLeft = !hitF && !!hitL;
+        let isRight = !hitF && !!hitR;
+        let isFront = !!hitF;
+
+        p.wallSide = isFront ? 0 : isLeft ? -1 : 1;
+
         // Determine wall normal
         let nx = 0, nz = 0;
         const dx = x - wallB.x;
@@ -259,33 +449,47 @@ export function PlayerController({ input, onTelemetryUpdate }) {
         }
         p.wallNormal = [nx, 0, nz];
 
-        // Soft gravity decay over 2.2s
-        const gravityDecay = THREE.MathUtils.lerp(0.12, 0.9, p.wallTimer / WALL_RUN_TIME);
-        vy += GRAVITY * gravityDecay * dt;
+        // 1. Vertical Wall Run (Running straight up a building facade)
+        if (isFront || (lookY > 0.3 && i.forward > 0)) {
+          p.state = STATES.WALL_RUNNING_UP;
+          // Soft upward momentum with gravity decay
+          const upwardSpeed = Math.max(14.0 * (1 - p.wallTimer / WALL_RUN_TIME), 2.0);
+          vy = upwardSpeed;
+          // Clamp distance from surface
+          vx = -nx * 0.5;
+          vz = -nz * 0.5;
+        } else {
+          // 2. Horizontal Wall Run (Tangent Lock along wall plane)
+          p.state = isLeft ? STATES.WALL_RUNNING_LEFT : STATES.WALL_RUNNING_RIGHT;
 
-        // Project forward along wall surface
-        const wallTangentX = -nz;
-        const wallTangentZ = nx;
-        const forwardDot = fx * wallTangentX + fz * wallTangentZ;
-        const wallDirX = wallTangentX * (forwardDot >= 0 ? 1 : -1);
-        const wallDirZ = wallTangentZ * (forwardDot >= 0 ? 1 : -1);
+          // Reduced gravity scalar (0.1g)
+          const gravityDecay = THREE.MathUtils.lerp(0.10, 0.85, p.wallTimer / WALL_RUN_TIME);
+          vy += GRAVITY * gravityDecay * dt;
 
-        const wallSpeed = Math.max(MAX_RUN, Math.hypot(vx, vz));
-        vx = wallDirX * wallSpeed;
-        vz = wallDirZ * wallSpeed;
+          const wallTangentX = -nz;
+          const wallTangentZ = nx;
+          const forwardDot = fx * wallTangentX + fz * wallTangentZ;
+          const wallDirX = wallTangentX * (forwardDot >= 0 ? 1 : -1);
+          const wallDirZ = wallTangentZ * (forwardDot >= 0 ? 1 : -1);
 
-        // Wall Jump impulse
-        if (p.jumpBuffer > 0) {
+          const wallSpeed = Math.max(MAX_RUN, Math.hypot(vx, vz));
+          vx = wallDirX * wallSpeed;
+          vz = wallDirZ * wallSpeed;
+        }
+
+        // Wall Jump / Exit vector
+        if (p.jumpBuffer > 0 || jumpPressed) {
           p.jumpBuffer = 0;
           p.phase = PHASE.AIR;
           p.state = STATES.WALL_JUMPING;
           p.wallTimer = 0;
-          vx = nx * 7.5 + wallDirX * 8.5;
-          vz = nz * 7.5 + wallDirZ * 8.5;
-          vy = 8.5;
+          // v_exit = (N_wall * k1) + (v_wall * k2) + (U_up * k3)
+          vx = nx * 8.5 + fx * 8.0;
+          vz = nz * 8.5 + fz * 8.0;
+          vy = 11.5;
         }
       } else {
-        // ---- AIR / GROUND ----
+        // ---- GROUND / AIR TRAVERSAL ----
         p.wallTimer = 0;
         p.wallSide = 0;
 
@@ -293,68 +497,165 @@ export function PlayerController({ input, onTelemetryUpdate }) {
         const onGround = y <= groundY + 0.08 && vy <= 0.1;
 
         if (onGround) {
+          // ─────────────────────────────────────────────────────────
+          // GROUND LOCOMOTION
+          // ─────────────────────────────────────────────────────────
           p.grounded = true;
           p.coyote = COYOTE;
           y = groundY;
           vy = 0;
+          p.phase = PHASE.GROUND;
 
-          // Ground Movement & Sprinting
-          const targetMax = i.sprint ? MAX_SPRINT : MAX_RUN;
-          if (hasWish) {
-            vx += wx * RUN_ACCEL * dt;
-            vz += wz * RUN_ACCEL * dt;
-            const hSpeed = Math.hypot(vx, vz);
-            if (hSpeed > targetMax) {
-              vx = (vx / hSpeed) * targetMax;
-              vz = (vz / hSpeed) * targetMax;
-            }
-            p.state = i.sprint ? STATES.SPRINTING : STATES.RUNNING;
-          } else {
-            // Apply ground friction
-            const hSpeed = Math.hypot(vx, vz);
-            const drop = FRICTION * dt * hSpeed;
-            const newSpeed = Math.max(0, hSpeed - drop);
-            if (hSpeed > 0.001) {
-              vx = (vx / hSpeed) * newSpeed;
-              vz = (vz / hSpeed) * newSpeed;
-            }
-            p.state = p.landTimer > 0 ? STATES.LANDING : STATES.IDLE;
+          // Clear dive kinetic energy or convert upon landing
+          if (p.diveKineticEnergy > 0) {
+            vx += fx * p.diveKineticEnergy * 0.8;
+            vz += fz * p.diveKineticEnergy * 0.8;
+            p.diveKineticEnergy = 0;
           }
 
-          // Ground Jump
-          if (p.jumpBuffer > 0 || (i.jump && p.coyote > 0)) {
-            p.jumpBuffer = 0;
-            p.coyote = 0;
-            vy = JUMP_IMPULSE;
-            p.grounded = false;
-            p.phase = PHASE.AIR;
-            p.state = STATES.JUMPING;
+          // CHARGED JUMP CHARGING ACCUMULATOR (Hold Shift+Ctrl or Ctrl/Shift+Space)
+          const isChargeHolding = (i.ctrl || i.sprint) && i.jump;
+          if (isChargeHolding) {
+            p.jumpCharging = true;
+            p.jumpChargeTime = Math.min(1.2, p.jumpChargeTime + dt);
+            p.jumpChargeRatio = clamp(p.jumpChargeTime / 1.0, 0, 1);
+            p.state = STATES.CHARGING_JUMP;
+            // Apply high ground friction while crouch charging
+            vx *= 0.85;
+            vz *= 0.85;
+          } else if (p.jumpCharging && (jumpReleased || !i.jump)) {
+            // CHARGED JUMP RELEASE
+            if (p.jumpChargeTime > 0.2) {
+              const chargeImpulse = JUMP_IMPULSE + p.jumpChargeRatio * 18.0; // Up to 32m/s
+              vy = chargeImpulse;
+              vx *= 1.35;
+              vz *= 1.35;
+              p.grounded = false;
+              p.phase = PHASE.AIR;
+              p.state = STATES.CHARGED_JUMP;
+              p.jumpChargeTime = 0;
+              p.jumpChargeRatio = 0;
+              p.jumpCharging = false;
+            } else {
+              p.jumpCharging = false;
+              p.jumpChargeTime = 0;
+              p.jumpChargeRatio = 0;
+            }
+          } else {
+            p.jumpCharging = false;
+            p.jumpChargeTime = 0;
+            p.jumpChargeRatio = 0;
+
+            // PARKOUR VAULTING CHECK (Sprint + W toward waist-high obstacle)
+            if (i.sprint && i.forward > 0) {
+              const vaultObstacle = checkVaultObstacle(x, y, z, fx, fz);
+              if (vaultObstacle) {
+                p.phase = PHASE.VAULT;
+                p.state = STATES.VAULTING;
+                vault.current = {
+                  from: [x, y, z],
+                  to: vaultObstacle.targetPos,
+                  height: vaultObstacle.vaultHeight,
+                  t: 0
+                };
+              }
+            }
+
+            // STANDARD RUN / SPRINT
+            const targetMax = i.sprint ? MAX_SPRINT : MAX_RUN;
+            if (hasWish && p.phase !== PHASE.VAULT) {
+              vx += wx * RUN_ACCEL * dt;
+              vz += wz * RUN_ACCEL * dt;
+              const hSpeed = Math.hypot(vx, vz);
+              if (hSpeed > targetMax) {
+                vx = (vx / hSpeed) * targetMax;
+                vz = (vz / hSpeed) * targetMax;
+              }
+              p.state = i.sprint ? STATES.SPRINTING : STATES.RUNNING;
+            } else if (p.phase !== PHASE.VAULT) {
+              // Ground friction
+              const hSpeed = Math.hypot(vx, vz);
+              const drop = FRICTION * dt * hSpeed;
+              const newSpeed = Math.max(0, hSpeed - drop);
+              if (hSpeed > 0.001) {
+                vx = (vx / hSpeed) * newSpeed;
+                vz = (vz / hSpeed) * newSpeed;
+              }
+              p.state = p.landTimer > 0 ? STATES.LANDING : STATES.IDLE;
+            }
+
+            // STANDARD JUMP
+            if (p.jumpBuffer > 0 || (jumpPressed && p.coyote > 0)) {
+              p.jumpBuffer = 0;
+              p.coyote = 0;
+              vy = JUMP_IMPULSE;
+              p.grounded = false;
+              p.phase = PHASE.AIR;
+              p.state = STATES.JUMPING;
+            }
           }
         } else {
-          // ---- IN AIR ----
+          // ─────────────────────────────────────────────────────────
+          // AIR LOCOMOTION, DIVE, GLIDE, TRICKS & AIR STEERING
+          // ─────────────────────────────────────────────────────────
           p.grounded = false;
           p.phase = PHASE.AIR;
           p.coyote = Math.max(0, p.coyote - dt);
 
-          // Dive or Glide Mechanics
-          const isDiving = i.down && vy < -2;
-          const isGliding = i.jump && vy < 0;
+          const isDiving = (i.ctrl || i.down) && vy < -1.5;
+          const isGliding = i.jump && vy < 0 && !isDiving;
+          const isTricking = i.trick && Math.abs(vy) > 2.0;
 
+          // AIR STEERING: Directional aerodynamic steering forces (A / D)
+          if (i.strafe !== 0) {
+            const sideSteerForce = 16.0;
+            vx += rx * i.strafe * sideSteerForce * dt;
+            vz += rz * i.strafe * sideSteerForce * dt;
+          }
+
+          // 1. AIRBORNE DIVE (g_dive = 2.5g)
           if (isDiving) {
             p.state = STATES.DIVING;
             vy += GRAVITY * DIVE_GRAVITY_SCALE * dt;
-            // Convert downward dive speed into forward aerodynamic drive
-            vx += fx * 16 * dt;
-            vz += fz * 16 * dt;
-          } else if (isGliding) {
+            // Accumulate kinetic energy
+            p.diveKineticEnergy += Math.abs(vy) * dt * 0.35;
+            // Forward aerodynamic drive
+            vx += fx * 18 * dt;
+            vz += fz * 18 * dt;
+          }
+          // 2. AIR TRICKS (Acrobatics)
+          else if (isTricking) {
+            p.state = STATES.AIR_TRICK;
+            p.trickActive = true;
+            trickTimerRef.current += dt;
+            vy += GRAVITY * dt;
+
+            // Maintain parabolic trajectory, apply angular momentum
+            const trickSpeed = 12.0;
+            if (i.forward !== 0) trickRotAccumRef.current.x += dt * trickSpeed * i.forward;
+            if (i.strafe !== 0) trickRotAccumRef.current.z += dt * trickSpeed * i.strafe;
+            trickRotAccumRef.current.y += dt * 6.0;
+
+            p.trickRotX = trickRotAccumRef.current.x;
+            p.trickRotY = trickRotAccumRef.current.y;
+            p.trickRotZ = trickRotAccumRef.current.z;
+
+            // Accumulate trick points
+            p.trickScore += Math.round(dt * 250);
+            p.trickName = i.forward > 0 ? 'FRONT FLIP 360' : i.strafe !== 0 ? 'CORKSCREW' : 'SPIDER SPIN';
+          }
+          // 3. GLIDING
+          else if (isGliding) {
             p.state = STATES.GLIDING;
-            // Cap falling speed to terminal glide
             vy = Math.max(GLIDE_TERMINAL, vy + GRAVITY * 0.25 * dt);
             if (hasWish) {
               vx += wx * AIR_ACCEL * dt;
               vz += wz * AIR_ACCEL * dt;
             }
-          } else {
+          }
+          // 4. STANDARD FALLING / JUMPING
+          else {
+            p.trickActive = false;
             p.state = vy > 0.5 ? STATES.JUMPING : STATES.FALLING;
             vy += GRAVITY * dt;
             if (hasWish) {
@@ -363,7 +664,15 @@ export function PlayerController({ input, onTelemetryUpdate }) {
             }
           }
 
-          // Ledge Mantle Detection (Check when nearing top edge of building)
+          // Pulling out of dive: convert vertical energy into forward speed
+          if (!isDiving && p.diveKineticEnergy > 0) {
+            const pulloutBoost = Math.min(p.diveKineticEnergy * 1.5, 14);
+            vx += fx * pulloutBoost;
+            vz += fz * pulloutBoost;
+            p.diveKineticEnergy = 0;
+          }
+
+          // LEDGE MANTLE DETECTION
           const ledgeY = ledgeTopAt(x + fx * 0.9, y + 1.2, z + fz * 0.9, 0.4);
           if (ledgeY !== null && ledgeY > y && ledgeY - y < 2.4 && vy > -8) {
             p.phase = PHASE.MANTLE;
@@ -377,7 +686,7 @@ export function PlayerController({ input, onTelemetryUpdate }) {
         }
       }
 
-      // Physics Position Integration
+      // Physics Integration
       x += vx * dt;
       y += vy * dt;
       z += vz * dt;
@@ -392,7 +701,7 @@ export function PlayerController({ input, onTelemetryUpdate }) {
     p.velocity[2] = vz;
     p.speed = Math.hypot(vx, vz);
 
-    // Smooth camera roll / lean in turns and wall runs
+    // Smooth camera roll / lean in turns and wall runs (12° body lean)
     let targetLean = 0;
     if (p.state === STATES.WALL_RUNNING_LEFT) targetLean = 0.21;
     if (p.state === STATES.WALL_RUNNING_RIGHT) targetLean = -0.21;
@@ -402,9 +711,18 @@ export function PlayerController({ input, onTelemetryUpdate }) {
     if (meshGroupRef.current) {
       meshGroupRef.current.position.set(x, y, z);
       meshGroupRef.current.rotation.y = p.rotation;
+      if (p.state === STATES.AIR_TRICK) {
+        meshGroupRef.current.rotation.x = p.trickRotX;
+        meshGroupRef.current.rotation.z = p.trickRotZ;
+      } else {
+        meshGroupRef.current.rotation.x = 0;
+        meshGroupRef.current.rotation.z = 0;
+      }
     }
 
-    // 5. "ON-TWOS" ANIMATION MODIFIER (12 FPS Stepped Keyframing)
+    // ─────────────────────────────────────────────────────────────
+    // 7. "ON-TWOS" ANIMATION MODIFIER (12 FPS Stepped Keyframing)
+    // ─────────────────────────────────────────────────────────────
     const animTick = Math.floor(state.clock.elapsedTime * 12);
     if (animTick !== lastAnimTickRef.current) {
       lastAnimTickRef.current = animTick;
@@ -428,6 +746,40 @@ export function PlayerController({ input, onTelemetryUpdate }) {
           rlRotX = legSwing;
           tRotX = 0.32; // forward pitch lean
           hRotX = -0.2;
+          break;
+        }
+        case STATES.CHARGING_JUMP: {
+          tRotX = 0.75; // Low crouch
+          laRotX = 0.6;
+          raRotX = 0.6;
+          llRotX = 1.1;
+          rlRotX = 1.1;
+          break;
+        }
+        case STATES.CHARGED_JUMP:
+        case STATES.POINT_LAUNCH: {
+          tRotX = 0.15;
+          laRotX = 2.8; // Arms swept back
+          raRotX = 2.8;
+          llRotX = -0.4;
+          rlRotX = -0.4;
+          break;
+        }
+        case STATES.VAULTING: {
+          tRotX = 0.55;
+          laRotX = 1.6; // One hand down
+          raRotX = -0.4;
+          llRotX = 0.9;
+          rlRotX = 0.9;
+          break;
+        }
+        case STATES.ZIP_TO_POINT:
+        case STATES.WEB_ZIP: {
+          tRotX = 0.45;
+          laRotX = 2.7; // Dual web shooters pointed forward
+          raRotX = 2.7;
+          llRotX = -0.3;
+          rlRotX = -0.3;
           break;
         }
         case STATES.DIVING: {
@@ -454,6 +806,15 @@ export function PlayerController({ input, onTelemetryUpdate }) {
           raRotX = 0.3;
           llRotX = 0.6;
           rlRotX = -0.4;
+          break;
+        }
+        case STATES.WALL_RUNNING_UP: {
+          tRotX = 0.55;
+          const climbFreq = 14;
+          laRotX = Math.sin(animTime * climbFreq) * 1.2;
+          raRotX = -Math.sin(animTime * climbFreq) * 1.2;
+          llRotX = -Math.sin(animTime * climbFreq) * 1.2;
+          rlRotX = Math.sin(animTime * climbFreq) * 1.2;
           break;
         }
         case STATES.WALL_RUNNING_LEFT: {
@@ -531,7 +892,10 @@ export function PlayerController({ input, onTelemetryUpdate }) {
         position: new THREE.Vector3(x, y, z),
         yaw: p.rotation,
         velocity: new THREE.Vector3(vx, vy, vz),
-        grounded: p.grounded
+        grounded: p.grounded,
+        trickScore: p.trickScore,
+        trickName: p.trickName,
+        jumpChargeRatio: p.jumpChargeRatio
       });
     }
 

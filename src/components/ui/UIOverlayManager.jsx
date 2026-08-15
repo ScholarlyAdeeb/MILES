@@ -9,6 +9,7 @@ import { useNetwork } from '../../NetworkEngine.jsx';
 import DeveloperHUD from './DeveloperHUD.jsx';
 import { LyricHUD } from '../../LyricHUD.jsx';
 import { RoomModal } from '../../RoomModal.jsx';
+import TraversalControlsHUD from './TraversalControlsHUD.jsx';
 import { 
   timeOfDayState, 
   TIME_PRESETS, 
@@ -404,12 +405,17 @@ export function UIOverlayManager({
       </div>
 
       {/* ─────────────────────────────────────────────────────────────
-          4. DEVELOPER MODE HUD (F3)
+          4. SPIDER-VERSE CONTROLS CHEATSHEET & LIVE TRICK/ENERGY HUD
+      ───────────────────────────────────────────────────────────── */}
+      <TraversalControlsHUD isDrivingMode={isDrivingMode} />
+
+      {/* ─────────────────────────────────────────────────────────────
+          5. DEVELOPER MODE HUD (F3)
       ───────────────────────────────────────────────────────────── */}
       <DeveloperHUD isVisible={devMode} onClose={onToggleDevMode} />
 
       {/* ─────────────────────────────────────────────────────────────
-          5. MULTIPLAYER CO-OP SESSION MODAL
+          6. MULTIPLAYER CO-OP SESSION MODAL
       ───────────────────────────────────────────────────────────── */}
       {isRoomModalOpen && <RoomModal />}
     </div>

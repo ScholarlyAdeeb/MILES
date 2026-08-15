@@ -6,6 +6,7 @@ import { player } from '../../playerState.js';
 import { BillboardHoarding } from '../../BillboardHoarding.jsx';
 import { AmbientRoadTraffic } from './AmbientRoadTraffic.jsx';
 import { DynamicWindowLights } from './DynamicWindowLights.jsx';
+import { ModularVernacularBuilding } from './ModularVernacularBuilding.jsx';
 
 // Reusable scratch objects
 const tempMatrix = new THREE.Matrix4();
@@ -92,9 +93,10 @@ export function CityManager({ day = false }) {
     );
   }, [centerChunk]);
 
-  // Aggregate all buildings of different sizes, billboards, and rooftop features
-  const { buildings, hoardings, rooftopFeatures } = useMemo(() => {
+  // Aggregate all buildings of different sizes, modular vernacular houses, billboards, and rooftop features
+  const { buildings, modularBuildings, hoardings, rooftopFeatures } = useMemo(() => {
     const bList = [];
+    const mList = [];
     const hList = [];
     const rList = [];
 
@@ -148,12 +150,19 @@ export function CityManager({ day = false }) {
           });
         }
       }
+
+      if (c.modularBuildings) {
+        for (const mb of c.modularBuildings) {
+          mList.push(mb);
+        }
+      }
+
       for (const h of c.hoardings) {
         hList.push(h);
       }
     }
 
-    return { buildings: bList, hoardings: hList, rooftopFeatures: rList };
+    return { buildings: bList, modularBuildings: mList, hoardings: hList, rooftopFeatures: rList };
   }, [activeChunks, day]);
 
   // Instanced Meshes Refs
@@ -350,7 +359,24 @@ export function CityManager({ day = false }) {
         ))}
       </group>
 
-      {/* 6. Emissive Animated Billboard Hoardings */}
+      {/* 6. Modular Vernacular Indian & Asian Town Architecture Buildings (From Reference Kit) */}
+      {modularBuildings.map((mb, idx) => (
+        <ModularVernacularBuilding
+          key={`modular-bldg-${mb.x.toFixed(1)}-${mb.z.toFixed(1)}-${idx}`}
+          type={mb.type}
+          x={mb.x}
+          y={0}
+          z={mb.z}
+          w={mb.w}
+          d={mb.d}
+          h={mb.h}
+          rotation={mb.rotation || 0}
+          colorIndex={mb.colorIndex || 0}
+          day={day}
+        />
+      ))}
+
+      {/* 7. Emissive Animated Billboard Hoardings */}
       {hoardings.map((h, i) => (
         <BillboardHoarding
           key={`hoarding-${centerChunk[0]}-${centerChunk[1]}-${i}`}
@@ -361,7 +387,7 @@ export function CityManager({ day = false }) {
         />
       ))}
 
-      {/* 7. Street Level Ground & Asphalt Grid */}
+      {/* 8. Street Level Ground & Asphalt Grid */}
       <mesh
         position={[
           centerChunk[0] * CHUNK_SIZE,

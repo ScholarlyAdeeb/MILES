@@ -10,6 +10,10 @@ export function useDrivingControls() {
     jump: false,
     grapple: false,
     dive: false,
+    ctrl: false,
+    zipPoint: false,
+    webZip: false,
+    trick: false,
     handbrake: false,
     devMode: false,
     isMobile: false
@@ -21,12 +25,17 @@ export function useDrivingControls() {
     strafe: 0,
     jump: false,
     sprint: false,
+    ctrl: false,
     down: false,
     yawDelta: 0,
     pitchDelta: 0,
     jumpPressed: false,
     jumpReleased: false,
-    grapplePressed: false
+    grapplePressed: false,
+    swingPressed: false,
+    zipPointPressed: false,
+    webZipPressed: false,
+    trick: false
   });
 
   useEffect(() => {
@@ -46,7 +55,7 @@ export function useDrivingControls() {
       const code = e.code;
       const key = e.key.toLowerCase();
 
-      if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(code)) {
+      if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyF', 'KeyC', 'KeyT'].includes(code)) {
         e.preventDefault();
       }
 
@@ -67,12 +76,21 @@ export function useDrivingControls() {
         if (key === 'a' || code === 'ArrowLeft') updated.left = true;
         if (key === 'd' || code === 'ArrowRight') updated.right = true;
         if (code === 'ShiftLeft' || code === 'ShiftRight') updated.sprint = true;
+        if (code === 'ControlLeft' || code === 'ControlRight') {
+          updated.ctrl = true;
+          updated.dive = true;
+        }
         if (code === 'Space') {
           updated.jump = true;
           updated.grapple = true;
         }
+        if (key === 'f') {
+          updated.handbrake = true;
+          updated.zipPoint = true;
+        }
+        if (key === 'c') updated.webZip = true;
+        if (key === 't') updated.trick = true;
         if (key === 'e' || key === 'q') updated.grapple = true;
-        if (key === 'f') updated.handbrake = true;
         return updated;
       });
 
@@ -85,10 +103,22 @@ export function useDrivingControls() {
       if (key === 'a' || code === 'ArrowLeft') inputStateRef.current.strafe = -1;
       if (key === 'd' || code === 'ArrowRight') inputStateRef.current.strafe = 1;
       if (code === 'ShiftLeft' || code === 'ShiftRight') inputStateRef.current.sprint = true;
+      if (code === 'ControlLeft' || code === 'ControlRight') {
+        inputStateRef.current.ctrl = true;
+        inputStateRef.current.down = true;
+      }
       if (code === 'Space') {
         inputStateRef.current.jump = true;
         inputStateRef.current.jumpPressed = true;
-        inputStateRef.current.grapplePressed = true;
+      }
+      if (key === 'f') {
+        inputStateRef.current.zipPointPressed = true;
+      }
+      if (key === 'c') {
+        inputStateRef.current.webZipPressed = true;
+      }
+      if (key === 't' || (inputStateRef.current.sprint && inputStateRef.current.ctrl)) {
+        inputStateRef.current.trick = true;
       }
       if (key === 'e' || key === 'q') {
         inputStateRef.current.grapplePressed = true;
@@ -111,18 +141,31 @@ export function useDrivingControls() {
         if (key === 'a' || code === 'ArrowLeft') updated.left = false;
         if (key === 'd' || code === 'ArrowRight') updated.right = false;
         if (code === 'ShiftLeft' || code === 'ShiftRight') updated.sprint = false;
+        if (code === 'ControlLeft' || code === 'ControlRight') {
+          updated.ctrl = false;
+          updated.dive = false;
+        }
         if (code === 'Space') {
           updated.jump = false;
           updated.grapple = false;
         }
+        if (key === 'f') {
+          updated.handbrake = false;
+          updated.zipPoint = false;
+        }
+        if (key === 'c') updated.webZip = false;
+        if (key === 't') updated.trick = false;
         if (key === 'e' || key === 'q') updated.grapple = false;
-        if (key === 'f') updated.handbrake = false;
         return updated;
       });
 
       if ((key === 'w' || code === 'ArrowUp') && inputStateRef.current.forward > 0) inputStateRef.current.forward = 0;
       if ((key === 's' || code === 'ArrowDown')) {
         if (inputStateRef.current.forward < 0) inputStateRef.current.forward = 0;
+        inputStateRef.current.down = inputStateRef.current.ctrl;
+      }
+      if (code === 'ControlLeft' || code === 'ControlRight') {
+        inputStateRef.current.ctrl = false;
         inputStateRef.current.down = false;
       }
       if ((key === 'a' || code === 'ArrowLeft') && inputStateRef.current.strafe < 0) inputStateRef.current.strafe = 0;
@@ -132,6 +175,7 @@ export function useDrivingControls() {
         inputStateRef.current.jump = false;
         inputStateRef.current.jumpReleased = true;
       }
+      if (key === 't') inputStateRef.current.trick = false;
     };
 
     const handleMouseMove = (e) => {
@@ -160,3 +204,4 @@ export function useDrivingControls() {
 }
 
 export default useDrivingControls;
+
